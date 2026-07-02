@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'vitest';
 import { withTargetDeviceResolutionScope } from '../../core/dispatch-resolve.ts';
 import { INTERNAL_COMMANDS, PUBLIC_COMMANDS } from '../../command-catalog.ts';
 import { makeSessionStore } from '../../__tests__/test-utils/store-factory.ts';
 import { getDaemonCommandRoute, type DaemonCommandRoute } from '../daemon-command-registry.ts';
+import { cleanupDownloadableArtifact, trackDownloadableArtifact } from '../artifact-tracking.ts';
 import { contextFromFlags } from '../context.ts';
 import { handleLeaseCommands } from '../handlers/lease.ts';
 import { LeaseRegistry } from '../lease-registry.ts';
@@ -148,6 +152,68 @@ test('lease handler preserves device-aware lease fields', async () => {
   assert.equal(heartbeatLease.deviceKey, 'device-1');
   assert.equal(heartbeatLease.clientId, 'client-a');
   assert.equal(heartbeatLease.leaseProvider, 'proxy');
+});
+
+test('lease artifacts lists daemon inventory for proxy lease scopes', async () => {
+  const leaseRegistry = new LeaseRegistry();
+  const sessionStore = makeSessionStore('agent-device-lease-artifacts-');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-device-lease-artifacts-'));
+  const artifactPath = path.join(tempDir, 'proxy-shot.png');
+  fs.writeFileSync(artifactPath, 'png-body');
+  const artifactId = trackDownloadableArtifact({
+    artifactPath,
+    fileName: 'proxy-shot.png',
+    tenantId: 'tenant-a',
+  });
+
+  try {
+    const response = await handleLeaseCommands({
+      req: {
+        command: PUBLIC_COMMANDS.artifacts,
+        token: 'test-token',
+        session: 'catalog-test',
+        meta: {
+          tenantId: 'tenant-a',
+          runId: 'run-a',
+          leaseId: 'lease-a',
+          leaseProvider: 'proxy',
+          deviceKey: 'device-1',
+          clientId: 'client-a',
+        },
+        positionals: [],
+      },
+      sessionName: 'catalog-test',
+      sessionStore,
+      leaseRegistry,
+    });
+
+    assert.equal(response?.ok, true);
+    const data = response.data as Record<string, unknown> | undefined;
+    assert.equal(data?.source, 'daemon');
+    const artifacts = data?.artifacts;
+    assert.ok(Array.isArray(artifacts));
+    assert.equal(artifacts.length, 1);
+    const artifact = artifacts[0] as Record<string, unknown> | undefined;
+    assert.deepEqual(
+      {
+        id: artifact?.id,
+        filename: artifact?.filename,
+        mimeType: artifact?.mimeType,
+        sizeBytes: artifact?.sizeBytes,
+      },
+      {
+        id: artifactId,
+        filename: 'proxy-shot.png',
+        mimeType: 'application/octet-stream',
+        sizeBytes: 'png-body'.length,
+      },
+    );
+    assert.equal(typeof artifact?.createdAt, 'string');
+    assert.equal(typeof artifact?.expiresAt, 'string');
+  } finally {
+    cleanupDownloadableArtifact(artifactId);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('lease release calls provider hook using the released lease without heartbeat mutation', async () => {

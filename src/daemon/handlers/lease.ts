@@ -1,15 +1,20 @@
 import { PUBLIC_COMMANDS } from '../../command-catalog.ts';
-import type { CloudArtifactProvider } from '../../cloud-artifacts.ts';
+import type { AgentArtifactsResult, CloudArtifactProvider } from '../../cloud-artifacts.ts';
 import type { DaemonRequest, DaemonResponse } from '../types.ts';
 import type { DeviceLease, LeaseRegistry } from '../lease-registry.ts';
 import type { SessionStore } from '../session-store.ts';
-import { resolveLeaseScope, resolveRequestOrSessionLeaseScope } from '../lease-context.ts';
+import {
+  isProxyLeaseScope,
+  resolveLeaseScope,
+  resolveRequestOrSessionLeaseScope,
+} from '../lease-context.ts';
 import {
   leaseScopeToAllocateRequest,
   leaseScopeToHeartbeatRequest,
   leaseScopeToReleaseRequest,
 } from '../../core/lease-scope.ts';
 import { AppError } from '../../kernel/errors.ts';
+import { listDownloadableArtifacts } from '../artifact-tracking.ts';
 
 export type LeaseLifecycleProvider = {
   allocate?: (
@@ -54,7 +59,10 @@ export async function handleLeaseCommands(args: LeaseHandlerArgs): Promise<Daemo
       const artifactScope = resolveRequestOrSessionLeaseScope(req, sessionStore.get(sessionName));
       return {
         ok: true,
-        data: await listCloudArtifactsForRequest(req, artifactScope, cloudArtifactProvider),
+        data: (await listArtifactsForRequest(req, artifactScope, cloudArtifactProvider)) as Record<
+          string,
+          unknown
+        >,
       };
     }
     case 'lease_allocate': {
@@ -104,12 +112,22 @@ export async function handleLeaseCommands(args: LeaseHandlerArgs): Promise<Daemo
   }
 }
 
-async function listCloudArtifactsForRequest(
+async function listArtifactsForRequest(
   req: DaemonRequest,
   leaseScope: ReturnType<typeof resolveLeaseScope>,
   cloudArtifactProvider: CloudArtifactProvider | undefined,
-) {
+): Promise<AgentArtifactsResult> {
   const providerSessionId = readFlagString(req.flags, 'providerSessionId');
+  if (isProxyLeaseScope(leaseScope) || (!leaseScope.leaseProvider && !providerSessionId)) {
+    const artifacts = await listDownloadableArtifacts(leaseScope.tenantId);
+    return {
+      source: 'daemon',
+      status: 'ready',
+      artifacts,
+      ...(artifacts.length === 0 ? { message: 'No daemon artifacts available.' } : {}),
+    };
+  }
+
   if (!leaseScope.leaseProvider) {
     throw new AppError(
       'INVALID_ARGS',
